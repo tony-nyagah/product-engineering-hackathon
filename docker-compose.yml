@@ -1,0 +1,147 @@
+# ── Commands ──────────────────────────────────────────────────────────────────
+#  docker compose up -d --build            # 1 app instance
+#  docker compose up -d --scale app=3      # 3 instances (Traefik auto-discovers)
+#  docker compose --profile seed up seed   # seed the database
+#
+# ── Observability URLs ────────────────────────────────────────────────────────
+#  http://localhost:8080   Traefik dashboard
+#  http://localhost:9100/metrics   Prometheus metrics
+#  http://localhost:16686  Jaeger tracing UI
+
+services:
+  # ── Traefik load balancer ────────────────────────────────────────────────────
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true" # Dashboard on :8080
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=pos_network"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=INFO"
+
+      # ── ACCESSLOG ─────────────────────────────────────────────────────────
+      # Logs every request Traefik routes (method, path, status, duration)
+      - "--accesslog=true"
+
+      # ── METRICS (Prometheus) ───────────────────────────────────────────────
+      # Exposes /metrics on :9100  →  http://localhost:9100/metrics
+      - "--entrypoints.metrics.address=:9100"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--metrics.prometheus.addEntryPointsLabels=true"
+      - "--metrics.prometheus.addServicesLabels=true"
+
+      # ── TRACING (OpenTelemetry → Jaeger) ───────────────────────────────────
+      # Sends traces to the Jaeger container below via OTLP gRPC
+      # View them at http://localhost:16686
+      - "--tracing.otlp=true"
+      - "--tracing.otlp.grpc.endpoint=jaeger:4317"
+      - "--tracing.otlp.grpc.insecure=true"
+
+    ports:
+      - "80:80" # App traffic
+      - "8080:8080" # Traefik dashboard
+      - "9100:9100" # Prometheus metrics
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - pos_network
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  # ── Jaeger (distributed tracing backend) ─────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # Jaeger UI  →  http://localhost:16686
+      - "4317:4317" # OTLP gRPC  (Traefik sends traces here)
+    networks:
+      - pos_network
+    restart: unless-stopped
+
+  # ── FastAPI app (scale with --scale app=N) ────────────────────────────────
+  app:
+    build: ./app
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pos:pos@postgres:5432/posdb
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pos-api.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.pos-api.entrypoints=web"
+      - "traefik.http.services.pos-api.loadbalancer.server.port=8000"
+    networks:
+      - pos_network
+    restart: unless-stopped
+
+  # ── Database seed (one-shot, run manually) ────────────────────────────────
+  seed:
+    build: ./app
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pos:pos@postgres:5432/posdb
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python seed.py
+    networks:
+      - pos_network
+    profiles:
+      - seed
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: pos
+      POSTGRES_PASSWORD: pos
+      POSTGRES_DB: posdb
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c work_mem=4MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pos -d posdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pos_network
+    restart: unless-stopped
+
+  # ── Redis cache ──────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pos_network
+    restart: unless-stopped
+
+networks:
+  pos_network:
+    name: pos_network
+    driver: bridge
+
+volumes:
+  postgres_data:
