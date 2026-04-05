@@ -1,3 +1,5 @@
+import asyncio
+
 from cache import cache_delete_pattern
 from database import get_db
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,11 +13,14 @@ router = APIRouter()
 
 @router.post("/", response_model=SaleResponse, status_code=201)
 async def create_sale(sale_data: SaleCreate, db: AsyncSession = Depends(get_db)):
+    product_ids = [item.product_id for item in sale_data.items]
+    result = await db.execute(select(Product).where(Product.id.in_(product_ids)))
+    products_by_id = {product.id: product for product in result.scalars().all()}
+
     total = 0.0
     line_items = []
     for item in sale_data.items:
-        result = await db.execute(select(Product).where(Product.id == item.product_id))
-        product = result.scalar_one_or_none()
+        product = products_by_id.get(item.product_id)
         if not product:
             raise HTTPException(
                 status_code=404, detail=f"Product {item.product_id} not found"
@@ -39,8 +44,8 @@ async def create_sale(sale_data: SaleCreate, db: AsyncSession = Depends(get_db))
         product.stock_quantity -= quantity
     await db.commit()
     await db.refresh(sale)
-    await cache_delete_pattern("inventory:*")
-    await cache_delete_pattern("reports:*")
+    asyncio.create_task(cache_delete_pattern("inventory:*"))
+    asyncio.create_task(cache_delete_pattern("reports:*"))
     return sale
 
 
